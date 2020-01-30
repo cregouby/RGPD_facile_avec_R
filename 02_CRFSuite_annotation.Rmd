@@ -1,0 +1,154 @@
+---
+title: "02 bnosac CRFsuite"
+author: "C.R."
+date: "27/01/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+reticulate::use_miniconda("spacy",required = T)
+library(udpipe)
+udmodel <- udpipe_download_model("french")
+udmodel <- udpipe_load_model(udmodel$file_model)
+library(jsonlite)
+library(tif) # from devtools::install_github("ropensci/tif")
+library(fuzzyjoin) # requires BiocManager::install("Iranges") for interval_inner_join
+library(crfsuite)
+```
+
+## split the Corpus into small chunks
+
+
+```{r corpus subset}
+load(here::here("data/discours_corpus_fr.Rda"))
+texts_40 <- sample_n(texts,size = 40)
+saveRDS(texts_40,file=(here::here("data/discours_subset_fr.Rds")))
+```
+
+## Create training data
+In order to facilitate creating training data on your own data, with your own categories, a Shiny app is put inside this R package. To go short, this app allows you to:
+
+Upload an data.frame with text you want to manually label in chunks. This data.frame should contain the fields doc_id and text and should be uploaded in .rds file format.
+Indicate the categories you want to use in your model
+Start annotating by selecting the chunk of text which belongs to the categories you defined
+
+
+```{r pressure, echo=FALSE}
+# Start Document annotation app
+rmarkdown::run(file = system.file(package = "crfsuite", "app", "annotation.Rmd"))
+# NER Tagger
+```
+
+The annotated data is saved to disk in .rds format and can be merged with a tokenised dataset. See the example in ?merge.chunks
+## Get back annotated dataset
+```{r}
+a<-readRDS(here::here("crfsuite_annotation_discours_subset_fr.Rds.rds"))
+```
+
+or the one from Doccano
+## Lecture du fichier de sortie des annotations
+
+```{r read annotation}
+jslite_annot <-jsonlite::stream_in(file(here::here("data/doccano_export_text_label.json")),verbose = T) %>% 
+  mutate(string_length = str_length(text))
+```
+
+## extraction des entités annotées
+```{r extract entities}
+annot_entit <- jslite_annot$labels %>% 
+  map(as_tibble,.id="doc_id") %>% enframe() %>%  unnest(value) %>% 
+  transmute(doc_id=as.numeric(name), start=as.numeric(V1), end=as.numeric(V2), entity=as.factor(V3)) %>% 
+  group_by(doc_id)
+(annot_entit %>% filter(doc_id==11))
+# # A tibble: 122 x 4
+# # Groups:   doc_id [8]
+#    doc_id start  stop entity
+#     <dbl> <dbl> <dbl> <fct> 
+#  1      1  2802  2808 Name  
+#  2      1  2850  2889 Name  
+#  3      2   531   547 Name  
+#  4      2   573   591 Name  
+```
+
+# tokenisation et part-of-speech
+```{r udpipe tokenisation }
+annot_df <- udpipe(x=jslite_annot %>% select(doc_id="id",text) , object=udmodel) # could be long
+# calculate token start position
+annot_tok <- annot_lst$token %>% 
+  group_by(doc_id) %>% 
+  mutate(tok_ofs = cumsum(str_length(token_with_ws)),
+         start = lag(tok_ofs) %>% replace_na(0L),
+         end = start + str_length(token))%>%
+  select(matches("id|token|start|end")) 
+
+(annot_tok %>% filter(doc_id==11) )
+# # A tibble: 101,835 x 8
+# # Groups:   doc_id [8]
+#    doc_id   sid   tid token                           token_with_ws                   tid_source start  stop
+#     <int> <int> <int> <chr>                           <chr>                                <int> <int> <int>
+#  1      1     1     1 610                             "610 "                                   2    NA    NA
+#  2      1     1     2 S                               "S "                                     0     4     5
+#  3      1     1     3 "                             " "                             "          2     6    35
+#  4      1     1     4 Devoir                          "Devoir "                                2    35    41
+#  5      1     1     5 no                              "no "                                   10    42    44
+```
+# Jointure tokens et annotations
+
+Pour chaque document (doc_id), on utilise `fuzzyjoin::interval_left_join` entre tokens et entités avec une jointure sur `start` et `end` pour couvrir le potentiel espace precedent l'entité annotée.
+
+```{r}
+tok_entities <- map_dfr(attributes(annot_entit)[["groups"]]$doc_id, 
+              ~interval_left_join(annot_tok %>% filter(doc_id==.x) , 
+                                   annot_entit %>% filter(doc_id==.x)  %>% ungroup %>% select(-doc_id), 
+                                   minoverlap = 2)
+          ) %>% filter(!str_detect(token,"^\\s+$"))
+```
+
+# Split training-set et test-set
+On stratifie sur les entites pour équilibrer les 2 datasets. Ici une correction manuelle est nécessaire. Et on sauve au format TSV pour constituer le fichier d'entrée de Stanford coreNLP
+```{r}
+train_doc_id <- tok_entities %>%
+  filter(!is.na(entity)) %>% 
+  group_by(doc_id, entity) %>%   summarise(num_rows=n()) %>% 
+  sample_frac(0.5, weight=num_rows) %>%
+  ungroup %>% 
+  select(doc_id) %>% 
+  unique %>%
+  filter(!doc_id==12) # manual intervention
+train <- tok_entities %>% filter(doc_id %in% train_doc_id$doc_id) %>% 
+  ungroup %>% 
+  select(token, entity)
+test <- tok_entities %>% filter(!doc_id %in% train_doc_id$doc_id) %>% 
+  ungroup %>% 
+  select(token, entity)
+summary(train)
+summary(test)
+```
+# Ajout des features pour CRF
+```{r TODO join to get back w POS}
+
+```
+
+```{r TODO add needed lag and lead values }
+# according to CRFSuite Vignette
+```
+
+# l'Entrainement du modèle
+```{r}
+model <- crf(y = train$entity, 
+             x = train[, c("pos", "pos_previous", "pos_next", 
+                               "token", "token_previous", "token_next")], 
+             group = train$doc_id, 
+             method = "lbfgs", file = "tagger.crfsuite",
+             options = list(max_iterations = 25, feature.minfreq = 5, c1 = 0, c2 = 1)) 
+model
+```
+
+# Mesure de l'accuracy
+```{r TODO}
+
+```
+
+

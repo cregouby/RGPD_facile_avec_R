@@ -1,0 +1,172 @@
+---
+title: "quanteda.io:readtext_test"
+author: "C.R."
+date: "05/10/2019"
+output: html_document
+---
+
+# Test de la library cleannlp 
+sur un corpus français
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+reticulate::use_condaenv("spacy")
+library(cleanNLP)
+# cnlp_download_spacy("fr-core-news-sm")
+cnlp_init_spacy(model_name = "fr")
+library(jsonlite)
+library(tif) # from devtools::install_github("ropensci/tif")
+library(fuzzyjoin) # requires BiocManager::install("Iranges") for interval_inner_join
+```
+
+## Lecture du fichier de sortie des annotations
+
+```{r read annotation}
+jslite_annot <-jsonlite::stream_in(file(here::here("data/doccano_export_text_label.json")),verbose = T) %>% 
+  mutate(string_length = str_length(text))
+# sampling on text 31
+# annot_lst31  <- cnlp_annotate(input=jslite_annot$text[31] %>% str_sub(1L,1000L),verbose = T)
+# annot_tok31 <- annot_lst31$token %>% 
+#   mutate(tok_ofs = cumsum(str_length(token_with_ws)),
+#          start = lag(tok_ofs),
+#          end = start + str_length(token)
+#          )
+```
+
+## extraction des entités annotées
+```{r extract entities}
+# DONOT USE map_dfr(as_tibble,.id="doc_id") as empty table are do not increment doc_id -> missalign doc_ids starting @ 5
+annot_entit <- jslite_annot$labels %>% 
+  map(as_tibble,.id="doc_id") %>% enframe() %>%  unnest(value) %>% 
+  transmute(doc_id=as.numeric(name), start=as.numeric(V1), end=as.numeric(V2), entity=as.factor(V3)) %>% 
+  group_by(doc_id)
+(annot_entit %>% filter(doc_id==11))
+# # A tibble: 122 x 4
+# # Groups:   doc_id [8]
+#    doc_id start  stop entity
+#     <dbl> <dbl> <dbl> <fct> 
+#  1      1  2802  2808 Name  
+#  2      1  2850  2889 Name  
+#  3      2   531   547 Name  
+#  4      2   573   591 Name  
+```
+
+# tokenisation
+```{r spacy tokenisation}
+annot_lst  <- cnlp_annotate(input=jslite_annot$text , verbose = T) # could be long
+# calculate token start position
+annot_tok <- annot_lst$token %>% 
+  group_by(doc_id) %>% 
+  mutate(tok_ofs = cumsum(str_length(token_with_ws)),
+         start = lag(tok_ofs) %>% replace_na(0L),
+         end = start + str_length(token))%>%
+  select(matches("id|token|start|end")) 
+
+(annot_tok %>% filter(doc_id==11) )
+# # A tibble: 101,835 x 8
+# # Groups:   doc_id [8]
+#    doc_id   sid   tid token                           token_with_ws                   tid_source start  stop
+#     <int> <int> <int> <chr>                           <chr>                                <int> <int> <int>
+#  1      1     1     1 610                             "610 "                                   2    NA    NA
+#  2      1     1     2 S                               "S "                                     0     4     5
+#  3      1     1     3 "                             " "                             "          2     6    35
+#  4      1     1     4 Devoir                          "Devoir "                                2    35    41
+#  5      1     1     5 no                              "no "                                   10    42    44
+```
+# Jointure tokens et annotations
+
+Pour chaque document (doc_id), on utilise `fuzzyjoin::interval_left_join` entre tokens et entités avec une jointure sur `start` et `end` pour couvrir le potentiel espace precedent l'entité annotée.
+
+```{r}
+# Find token_ids matchin start (, start+1, start-1)
+# Poor initial Algorithm Idea
+# - missing all internal tokens when long strings are annotated
+# - missing unexact matching (trailing or leading ws)
+# start_tid <-annot_tok   %>% 
+#   inner_join(annot_entit, by= c("doc_id", "start")) # gives 373 out of 498
+# stop_tid <-annot_tok   %>% 
+#   inner_join(annot_entit, by= c("doc_id", "end")) # gives 385 out of 498
+# outer_tid <- anti_join(start_tid %>% select(matches("id$|token$|label")),
+#                        stop_tid %>% select(matches("id$|token$|label")),
+#                        by=c("doc_id","sid","tid")) # 345 unique tokens
+# total_tid <-bind_rows(start_tid, stop_tid) %>% 
+#   distinct(doc_id,sid,tid)
+#   
+# Test via inner-join, target is a left_join
+# a<-interval_inner_join(annot_entit %>% filter(doc_id==1), 
+#                       annot_tok %>% filter(doc_id==1)  %>% ungroup %>% select(-doc_id), 
+#                       minoverlap = 2)
+# -- Sans filtre sur le doc_id, le groupe ne joue pas et on obtient
+#Joining by: c("doc_id", "start", "end")
+# Error in index_match_fun(d1, d2) : 
+#   interval_join must join on exactly two columns (start and end)
+
+#
+tok_entities <- map_dfr(attributes(annot_entit)[["groups"]]$doc_id, 
+              ~interval_left_join(annot_tok %>% filter(doc_id==.x) , 
+                                   annot_entit %>% filter(doc_id==.x)  %>% ungroup %>% select(-doc_id), 
+                                   minoverlap = 2)
+          ) %>% filter(!str_detect(token,"^\\s+$"))
+```
+# Split training-set et test-set
+On stratifie sur les entites pour équilibrer les 2 datasets. Ici une correction manuelle est nécessaire. Et on sauve au format TSV pour constituer le fichier d'entrée de Stanford coreNLP
+```{r}
+train_doc_id <- tok_entities %>%
+  filter(!is.na(entity)) %>% 
+  group_by(doc_id, entity) %>%   summarise(num_rows=n()) %>% 
+  sample_frac(0.5, weight=num_rows) %>%
+  ungroup %>% 
+  select(doc_id) %>% 
+  unique %>%
+  filter(!doc_id==12) # manual intervention
+train <- tok_entities %>% filter(doc_id %in% train_doc_id$doc_id) %>% 
+  ungroup %>% 
+  select(token, entity)
+test <- tok_entities %>% filter(!doc_id %in% train_doc_id$doc_id) %>% 
+  ungroup %>% 
+  select(token, entity)
+summary(train)
+summary(test)
+```
+Quand l'équilibre entre les entités est correct, on sauve les fichiers d'entrainement au format `conll`
+```{r}
+write_tsv(train,path = here::here("data/train.tsv"),col_names = F, quote_escape = "double", na="0")
+write_tsv(test,path = here::here("data/test.tsv"),col_names = F, quote_escape = "double", na="0")
+```
+
+# CleanNLP training our own NER model
+
+## Download jar and train the model
+the coreNLP ner model are manually downloaded by cleanNLP/extdata folder from `https://nlp.stanford.edu/software/stanford-ner-2018-10-16.zip`
+```{bash}
+cat <<EOF > data/crf_model_parameters.prop
+trainFile = data/train.tsv
+serializeTo = data/ner-model-fr-corenlp.ser.gz
+map = word=0,answer=1
+
+useClassFeature=true
+useWord=true
+useNGrams=true
+noMidNGrams=true
+maxNGramLeng=6
+usePrev=true
+useNext=true
+useSequences=true
+usePrevSequences=true
+maxLeft=1
+useTypeSeqs=true
+useTypeSeqs2=true
+useTypeySequences=true
+wordShape=chris2useLC
+useDisjunctive=true
+EOF
+for file in `find /usr/local/lib/R/site-library/cleanNLP/extdata/stanford-ner-2018-10-16/ -name "*.jar"`; do export CLASSPATH="$CLASSPATH:`realpath $file`"; done
+java edu.stanford.nlp.ie.crf.CRFClassifier -prop data/crf_model_parameters.prop -testFile data/test.tsv
+```
+## Check result on test-set
+```{bash}
+for file in `find /usr/local/lib/R/site-library/cleanNLP/extdata/stanford-ner-2018-10-16/ -name "*.jar"`; do export CLASSPATH="$CLASSPATH:`realpath $file`"; done
+java edu.stanford.nlp.ie.crf.CRFClassifier -loadClassifier data/ner-model-fr.ser.gz -textFile data/test.tsv -outputFormat tabbedEntities >./data/test_result.tsv
+
+```
+

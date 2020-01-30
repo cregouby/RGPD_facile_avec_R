@@ -1,0 +1,84 @@
+---
+title: "quanteda.io:readtext_test"
+author: "C.R."
+date: "05/10/2019"
+output: html_document
+---
+
+Test of the Quanteda library familly on french corpus
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(quanteda)
+library(cld3)
+library(jsonlite)
+```
+
+## Extract text from download directory
+
+```{r cars}
+library(readtext)
+DATA_DIR <- "~/Download/"
+# read in all files from a folder
+texts <-readtext(file=paste0(DATA_DIR, "/*.pdf"), docvarsfrom = "metadata",verbosity = 2)
+# Reading texts from ~/Download/*.pdf
+# PDF error: Invalid Font Weight
+#...
+# PDF error: Could not parse ligature component "folder" of "folder_close_alt" in parseCharName
+# PDF error: Could not parse ligature component "close" of "folder_close_alt" in parseCharName
+
+# PDF error: Could not parse ligature component "level" of "level_down" in parseCharName
+# PDF error: Could not parse ligature component "down" of "level_down" in parseCharName
+#  ... read 108 documents.
+# texts
+# readtext object consisting of 108 documents and 0 docvars.
+# # Description: df[,2] [108 × 2]
+#   doc_id                                   text               
+#   <chr>                                    <chr>              
+# 1 10.1038@s41598-017-12401-8.pdf           "\"          \"..."
+# 2 1703_WhyDoWeVisualiseData.pdf            "\"Lisa Charl\"..."
+# 3 1910012156_TL-MR3020(EU)_V3_UG.pdf       "\"User Guide\"..."
+
+# TODO de-duplicate docs fails
+# corpus <- corpus(unique(x=texts, by="text"))
+corpus <-corpus(texts)
+save(texts, corpus, file = here::here("data/discours_corpus_fr.Rda"))
+```
+
+## corpus 
+```{r pressure, echo=FALSE}
+summary(corpus)
+```
+
+# What is the Vanillia NER capability in spacy
+
+## Step 1 Language detection
+Are we using the right spacy model? i.e. wich one match `english` language ? 
+```{r}
+texts <- texts %>% mutate(lang=detect_language(text))
+corpus_fr <- corpus(texts %>% filter(lang=="fr"))
+b <- texts(corpus_fr) %>% enframe
+```
+
+# Export fr text into json
+```{r}
+# ndjson_write function is missing
+a<- texts %>% filter(lang=="fr") %>% select(text, meta=doc_id) 
+walk(a, ~write_lines(rjson::toJSON(.x),path = here::here("data/discours_corpus_fr.json"),append = TRUE))
+```
+
+# Export fr sentences into a dataframe
+```{r eval=FALSE, include=FALSE}
+# ndjson_write function is missing
+sentences<- corpus_fr %>% tokens(what="sentence") %>% unlist %>% enframe
+save(sentences, file = here::here("data/discours_phrases_fr.json"))
+```
+
+# Export fr text unitary text files
+```{r eval=FALSE, include=FALSE}
+walk(a, ~write_file(.x, path = here::here(str_c("data/",uuid::UUIDgenerate(),".txt"))))
+```
+
+
+# Time to annotate with doccano/... container...

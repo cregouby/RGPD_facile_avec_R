@@ -1,0 +1,111 @@
+---
+title: "quanteda.io:readtext_test"
+author: "C.R."
+date: "05/10/2019"
+output: html_document
+---
+
+Test of the Quanteda library familly on french corpus
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(reticulate)
+use_miniconda(condaenv = "spacy_condaenv")
+library(cleanNLP)
+# cnlp_download_spacy("fr-core-news-sm")
+cnlp_init_spacy(model_name = "fr")
+# library(spacyr)
+# spacy_initialize(model = "fr_core_news_sm")
+library(jsonlite)
+library(tif) # from devtools::install_github("ropensci/tif")
+library(fuzzyjoin) # requires BiocManager::install("Iranges") for interval_inner_join
+```
+
+## Extract text from download directory
+
+```{r read annotation}
+
+jslite_annot <-jsonlite::stream_in(file(here::here("data/doccano_export_text_label.json")),verbose = T) %>% 
+  mutate(string_length = str_length(text),
+         anno_length   = map_int(labels,length) )
+# sampling on text 31
+# annot_lst31  <- cnlp_annotate(input=jslite_annot$text[31] %>% str_sub(1L,1000L),verbose = T)
+# annot_tok31 <- annot_lst31$token %>% 
+#   mutate(tok_ofs = cumsum(str_length(token_with_ws)),
+#          start = lag(tok_ofs),
+#          end = start + str_length(token)
+#          )
+```
+
+# Split training-set et test-set
+On stratifie sur les entites pour équilibrer les 2 datasets. Ici une correction manuelle est nécessaire.
+```{r}
+train_doc_id <- jslite_annot %>% as_tibble %>% 
+  filter((anno_length>0 | !is.na(annotation_approver))) #%>% 
+  group_by(doc_id, entity) %>%   summarise(num_rows=n()) %>% 
+  sample_frac(0.5, weight=num_rows) %>%
+  ungroup %>% 
+  select(doc_id) %>% 
+  unique %>%
+  filter(!doc_id==12) # manual intervention
+train <- tok_entities %>% filter(doc_id %in% train_doc_id$doc_id)
+test <- tok_entities %>% filter(!doc_id %in% train_doc_id$doc_id) 
+summary(train)
+summary(test)
+```
+Quand l'équilibre entre les entités est correct, on sauve les fichiers d'entrainement au format `conll`
+
+
+# Spacy training our own NER model
+as per spacy doc, "If you want to write your own model, you can set it into the spaCy pipeline as follows: `nlp.pipeline.append(entity_recognizer)`. Your function needs to be a callable that takes a `doc` object as its argument, and sets the entities in-place. You can set the entities by writing to `doc.ents` -- you'll need a sequence of (start, end, label) tuples."
+
+```{python}
+def train_spacy(data,iterations):
+    TRAIN_DATA = data
+    nlp = spacy.blank('fr')  # create blank Language class
+    # create the built-in pipeline components and add them to the pipeline
+    # nlp.create_pipe works for built-ins that are registered with spaCy
+    if 'ner' not in nlp.pipe_names:
+        ner = nlp.create_pipe('ner')
+        nlp.add_pipe(ner, last=True)
+       
+
+    # add labels
+    for _, annotations in TRAIN_DATA:
+         for ent in annotations.get('entities'):
+            ner.add_label(ent[2])
+
+    # get names of other pipes to disable them during training
+    other_pipes = [pipe for pipe in nlp.pipe_names if pipe != 'ner']
+    with nlp.disable_pipes(*other_pipes):  # only train NER
+        optimizer = nlp.begin_training()
+        for itn in range(iterations):
+            print("Statring iteration " + str(itn))
+            random.shuffle(TRAIN_DATA)
+            losses = {}
+            for text, annotations in TRAIN_DATA:
+                nlp.update(
+                    [text],  # batch of texts
+                    [annotations],  # batch of annotations
+                    drop=0.2,  # dropout - make it harder to memorise data
+                    sgd=optimizer,  # callable to update weights
+                    losses=losses)
+            print(losses)
+    return nlp
+```
+
+```{r}
+source_python("train_spacy.py")
+prdnlp <-  train_spacy(train, 20)
+
+# Save our trained Model
+prdnlp$to_disk("data/ner-model-fr-spacy.pkl")
+
+#Test your text
+doc <- prdnlp(test)
+for ent in doc.ents:
+    print(ent.text, ent.start_char, ent.end_char, ent.label_)
+
+```
+
