@@ -17,3 +17,4 @@ docker container start doccano
 #To stop the container, run docker container stop doccano -t 5. All data created in the container will persist across restarts.
 
 #Access http://127.0.0.1:8000/.
+echo "You can now access it @ http://127.0.0.1:8000/"

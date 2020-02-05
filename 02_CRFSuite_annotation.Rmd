@@ -10,19 +10,21 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 reticulate::use_miniconda("spacy",required = T)
 library(udpipe)
-udmodel <- udpipe_download_model("french")
-udmodel <- udpipe_load_model(udmodel$file_model)
+#udmodel <- udpipe_download_model("french")
+#udmodel <- udpipe_load_model(udmodel$file_model)
+udmodel <- udpipe_load_model(here::here("french-gsd-ud-2.4-190531.udpipe"))
 library(jsonlite)
-library(tif) # from devtools::install_github("ropensci/tif")
-library(fuzzyjoin) # requires BiocManager::install("Iranges") for interval_inner_join
+#library(tif) # from devtools::install_github("ropensci/tif")
+library(fuzzyjoin) # requires BiocManager::install("Iranges") for interval_inner_join()
 library(crfsuite)
+library(data.table)
 ```
 
 ## split the Corpus into small chunks
 
 
-```{r corpus subset}
-load(here::here("data/discours_corpus_fr.Rda"))
+```{r corpus subset, eval=FALSE, include=FALSE}
+load(here::here("data/discours_corpus_fr.Rda")) # contains texts and corpus
 texts_40 <- sample_n(texts,size = 40)
 saveRDS(texts_40,file=(here::here("data/discours_subset_fr.Rds")))
 ```
@@ -35,7 +37,7 @@ Indicate the categories you want to use in your model
 Start annotating by selecting the chunk of text which belongs to the categories you defined
 
 
-```{r pressure, echo=FALSE}
+```{r, eval=FALSE, include=FALSE}
 # Start Document annotation app
 rmarkdown::run(file = system.file(package = "crfsuite", "app", "annotation.Rmd"))
 # NER Tagger
@@ -43,7 +45,7 @@ rmarkdown::run(file = system.file(package = "crfsuite", "app", "annotation.Rmd")
 
 The annotated data is saved to disk in .rds format and can be merged with a tokenised dataset. See the example in ?merge.chunks
 ## Get back annotated dataset
-```{r}
+```{r eval=FALSE, include=FALSE}
 a<-readRDS(here::here("crfsuite_annotation_discours_subset_fr.Rds.rds"))
 ```
 
@@ -51,8 +53,10 @@ or the one from Doccano
 ## Lecture du fichier de sortie des annotations
 
 ```{r read annotation}
-jslite_annot <-jsonlite::stream_in(file(here::here("data/doccano_export_text_label.json")),verbose = T) %>% 
+options(encoding="UTF-8")
+jslite_annot <-jsonlite::stream_in(file(here::here("data/doccano_export_telechargement_1file_fr.json")),verbose = T) %>% 
   mutate(string_length = str_length(text))
+jslite_raw <- jsonlite::stream_in(file(here::here("data/telechargement_corpus_fr.json")),verbose = T) 
 ```
 
 ## extraction des entités annotées
@@ -61,55 +65,96 @@ annot_entit <- jslite_annot$labels %>%
   map(as_tibble,.id="doc_id") %>% enframe() %>%  unnest(value) %>% 
   transmute(doc_id=as.numeric(name), start=as.numeric(V1), end=as.numeric(V2), entity=as.factor(V3)) %>% 
   group_by(doc_id)
-(annot_entit %>% filter(doc_id==11))
-# # A tibble: 122 x 4
-# # Groups:   doc_id [8]
-#    doc_id start  stop entity
-#     <dbl> <dbl> <dbl> <fct> 
-#  1      1  2802  2808 Name  
-#  2      1  2850  2889 Name  
-#  3      2   531   547 Name  
-#  4      2   573   591 Name  
+(annot_entit %>% filter(doc_id==8))
+# # A tibble: 25 x 4
+# # Groups:   doc_id [1]
+#    doc_id start   end entity  
+#     <dbl> <dbl> <dbl> <fct>   
+#  1     11   182   198 Name    
+#  2     11   248   296 addresse
+#  3     11   309   333 email   
+# cross check with text position
+jslite_annot[8,"text"] %>% str_sub(182,333)
+#[1] "\nMohammad Ghoniem (Luxembourg Institute of Science and Technology)\n5, avenue des Hauts-Fourneaux, Esch-sur-Alzette (Luxembourg)\nmohammad.ghoniem@list.lu"
 ```
 
-# tokenisation et part-of-speech
+# tokenisation et part-of-speech tagging
 ```{r udpipe tokenisation }
-annot_df <- udpipe(x=jslite_annot %>% select(doc_id="id",text) , object=udmodel) # could be long
-# calculate token start position
-annot_tok <- annot_lst$token %>% 
-  group_by(doc_id) %>% 
-  mutate(tok_ofs = cumsum(str_length(token_with_ws)),
-         start = lag(tok_ofs) %>% replace_na(0L),
-         end = start + str_length(token))%>%
-  select(matches("id|token|start|end")) 
+annot_df <- udpipe(x=jslite_annot %>% select(doc_id="id",text) , object=udmodel , parallel.cores = 4) # could be long : [248k, 17]
+# annot_df %>%  filter(doc_id==67, start>150) %>% select(start,end,sentence_id,misc,token) %>%  head(20) %>% as.data.frame()
+#  start end sentence_id            misc            token
+# 1    158 158           1 SpacesAfter=\\n                :
+# 2    160 167           1            <NA>         Mohammad
+# 3    169 175           1            <NA>          Ghoniem
+# 4    177 177           1   SpaceAfter=No                (
+# 5    178 187           1            <NA>       Luxembourg
+# 6    189 197           1            <NA>        Institute
+# 7    199 200           1            <NA>               of
+# 8    202 208           1            <NA>          Science
+# 9    210 212           1            <NA>              and
+# 10   214 223           1   SpaceAfter=No       Technology
+# 11   224 224           1 SpacesAfter=\\n                )
+# 12   226 226           1   SpaceAfter=No                5
+# 13   227 227           1            <NA>                ,
+# 14   229 234           1            <NA>           avenue
+# 15   236 238           1            <NA>              des
+# 16   240 254           1   SpaceAfter=No  Hauts-Fourneaux
+# 17   255 255           1            <NA>                ,
+# 18   257 272           1            <NA> Esch-sur-Alzette
+# 19   274 274           1   SpaceAfter=No                (
+# 20   275 284           1   SpaceAfter=No       Luxembourg
 
-(annot_tok %>% filter(doc_id==11) )
-# # A tibble: 101,835 x 8
-# # Groups:   doc_id [8]
-#    doc_id   sid   tid token                           token_with_ws                   tid_source start  stop
-#     <int> <int> <int> <chr>                           <chr>                                <int> <int> <int>
-#  1      1     1     1 610                             "610 "                                   2    NA    NA
-#  2      1     1     2 S                               "S "                                     0     4     5
-#  3      1     1     3 "                             " "                             "          2     6    35
-#  4      1     1     4 Devoir                          "Devoir "                                2    35    41
-#  5      1     1     5 no                              "no "                                   10    42    44
+# TODO BUG in doccano? we have a shift of -23 compared to actual doccano annotation. Shall we recode the start & end ?
+# fix this through annot_shift
+annot_shift <- jslite_raw %>%  group_by(id) %>% summarise(shift = str_length(text)-str_length(str_trim(text,side = "left"))) %>% rowid_to_column("doc_id")
+# TODO "Mohamad Ghoniem" is now at start=168, annotation sees it at 183 (need +15)
+annot_tok <- annot_df %>% 
+  mutate(doc_id = as.integer(doc_id)-59) %>% 
+  group_by(doc_id) %>% 
+  left_join(annot_shift) %>% 
+  mutate(start = start + shift,
+         end = end + shift,
+         space_no = -cumsum(str_count(misc,"=No") %>% replace_na(0L)),
+         tok_s = cumsum(str_count(misc,"\\\\s") %>% replace_na(0L)),
+         tok_n = cumsum(str_count(misc,"\\\\n") %>% replace_na(0L)),
+         tok_pile = cumsum(str_length(token)+1L)-1,
+         repl_tok = -cumsum((str_length(token)+1L)*is.na(start)),
+         end_n = shift + tok_pile + repl_tok + (lag(space_no) + lag(tok_s) + lag(tok_n)) %>% replace_na(0L),
+         start_n = end_n - str_length(token) +1) %>%
+  select(-matches("token_id|sentence|term_id|deps")) 
+
+(annot_tok %>% filter(doc_id==8, start>160) )
+#   doc_id paragraph_id start   end token    lemma    upos  xpos  feats dep_rel   misc        id             shift space_no tok_s tok_n tok_pile repl_tok end_n start_n
+#     <dbl>        <int> <int> <int> <chr>    <chr>    <chr> <chr> <chr> <chr>     <chr>       <chr>          <int>    <int> <int> <int>    <dbl>    <int> <dbl>   <dbl>
+#  1      8            1   166   166 :        :        PUNCT NA    NA    punct     "SpacesAft… atelier_VIF_E…     8       -5    47     4      139        0   192     192
+#  2      8            1   168   175 Mohammad Mohammad PROPN NA    NA    appos      NA         atelier_VIF_E…     8       -5    47     4      148        0   202     195
+#  3      8            1   177   183 Ghoniem  Ghoniem  PROPN NA    NA    flat:name  NA         atelier_VIF_E…     8       -5    47     4      156        0   210     204
+#  4      8            1   185   185 (        (        PUNCT NA    NA    punct     "SpaceAfte… atelier_VIF_E…     8       -6    47     4      158        0   212     212
+#  5      8            1   186   195 Luxembo… Luxembo… X     NA    NA    appos      NA         atelier_VIF_E…     8       -6    47     4      169        0   222     213
+#  6      8            1   197   205 Institu… Institu… X     NA    NA    flat:for…  NA         atelier_VIF_E…     8       -6    47     4      179        0   232     224
+#  7      8            1   207   208 of       of       X     NA    NA    flat:for…  NA         atelier_VIF_E…     8       -6    47     4      182        0   235     234
+#  8      8            1   210   216 Science  Science  X     NA    NA    flat:for…  NA         atelier_VIF_E…     8       -6    47     4      190        0   243     237
+#  9      8            1   218   220 and      and      X     NA    NA    flat:for…  NA         atelier_VIF_E…     8       -6    47     4      194        0   247     245
+# 10      8            1   222   231 Technol… Technol… X     NA    NA    flat:for… "SpaceAfte… atelier_VIF_E…     8       -7    47     4      205        0   258     249
 ```
-# Jointure tokens et annotations
+# Jointure du texte tokenisé et des annotations
 
 Pour chaque document (doc_id), on utilise `fuzzyjoin::interval_left_join` entre tokens et entités avec une jointure sur `start` et `end` pour couvrir le potentiel espace precedent l'entité annotée.
 
 ```{r}
-tok_entities <- map_dfr(attributes(annot_entit)[["groups"]]$doc_id, 
-              ~interval_left_join(annot_tok %>% filter(doc_id==.x) , 
+tok_w_entities <- map_dfr(attributes(annot_entit)[["groups"]]$doc_id, 
+              ~interval_left_join(annot_tok %>% filter(doc_id==.x, !is.na(start)) %>% ungroup %>% select(doc_id, start,end,token,upos,dep_rel) , 
                                    annot_entit %>% filter(doc_id==.x)  %>% ungroup %>% select(-doc_id), 
+                                   by=c("start","end"), #default, just to prevent Info message
                                    minoverlap = 2)
-          ) %>% filter(!str_detect(token,"^\\s+$"))
+          ) %>% filter(!str_detect(token,"^\\s+$")) %>% 
+  mutate_at(vars(doc_id,entity),as.character)
 ```
 
 # Split training-set et test-set
 On stratifie sur les entites pour équilibrer les 2 datasets. Ici une correction manuelle est nécessaire. Et on sauve au format TSV pour constituer le fichier d'entrée de Stanford coreNLP
 ```{r}
-train_doc_id <- tok_entities %>%
+train_doc_id <- tok_w_entities %>%
   filter(!is.na(entity)) %>% 
   group_by(doc_id, entity) %>%   summarise(num_rows=n()) %>% 
   sample_frac(0.5, weight=num_rows) %>%
@@ -117,38 +162,73 @@ train_doc_id <- tok_entities %>%
   select(doc_id) %>% 
   unique %>%
   filter(!doc_id==12) # manual intervention
-train <- tok_entities %>% filter(doc_id %in% train_doc_id$doc_id) %>% 
+train <- tok_w_entities %>% filter(doc_id %in% train_doc_id$doc_id) %>% 
   ungroup %>% 
-  select(token, entity)
-test <- tok_entities %>% filter(!doc_id %in% train_doc_id$doc_id) %>% 
-  ungroup %>% 
-  select(token, entity)
-summary(train)
-summary(test)
+  select(doc_id, start = start.x, end =  end.x,  token, upos, dep_rel,  entity)
+test <- tok_w_entities %>% filter(!doc_id %in% train_doc_id$doc_id) %>% 
+  ungroup  %>% 
+  select(doc_id, start = start.x, end =  end.x,  token, upos, dep_rel,  entity)
+summary(train %>% mutate_if(is.character,as.factor))
+summary(test %>%  mutate_if(is.character,as.factor))
 ```
 # Ajout des features pour CRF
-```{r TODO join to get back w POS}
-
-```
-
-```{r TODO add needed lag and lead values }
-# according to CRFSuite Vignette
+```{r TODO join to get back w POS the datatable way}
+make_crf_features <- function(udpipe_df) {
+  x <- as.data.table(udpipe_df)
+  x <- x[, upos_previous  := shift(upos, n = 1, type = "lag"), by = list(doc_id)]
+  x <- x[, upos_next      := shift(upos, n = 1, type = "lead"), by = list(doc_id)]
+  x <- x[, token_previous := shift(token, n = 1, type = "lag"), by = list(doc_id)]
+  x <- x[, token_next     := shift(token, n = 1, type = "lead"), by = list(doc_id)]
+  x <- x[, dep_previous   := shift(dep_rel, n = 1, type = "lag"), by = list(doc_id)]
+  x <- x[, dep_next       := shift(dep_rel, n = 1, type = "lead"), by = list(doc_id)]
+  #Note that CRFsuite handles all attributes equivalently, in order to distinguish between the columns, we need to prepend the column name logic to each column similar as shown at http://www.chokkan.org/software/crfsuite/tutorial.html. This is done using a custom txt_sprintf function which is similar as sprintf but handles NA values gracefully.
+  
+  x <- x[, upos_previous   := txt_sprintf("pos[w-1]=%s", upos_previous), by = list(doc_id)]
+  x <- x[, upos_next       := txt_sprintf("pos[w+1]=%s", upos_next), by = list(doc_id)]
+  x <- x[, token_previous := txt_sprintf("token[w-1]=%s", token_previous), by = list(doc_id)]
+  x <- x[, token_next     := txt_sprintf("token[w+1]=%s", token_next), by = list(doc_id)]
+  x <- x[, dep_previous   := txt_sprintf("dep[w-1]=%s", token_next), by = list(doc_id)]
+  x <- x[, dep_next       := txt_sprintf("dep[w+1]=%s", token_next), by = list(doc_id)]
+  subset(x, doc_id == 8, select = c("doc_id", "token", "token_previous", "token_next"))
+  return( as.data.frame(x))
+}
+train <- make_crf_features(train)
+test <- make_crf_features(test)
 ```
 
 # l'Entrainement du modèle
 ```{r}
 model <- crf(y = train$entity, 
-             x = train[, c("pos", "pos_previous", "pos_next", 
-                               "token", "token_previous", "token_next")], 
+             x = train[, c("upos", "upos_previous", "upos_next", "token", "token_previous", "token_next","dep_rel","dep_previous","dep_next")], 
              group = train$doc_id, 
-             method = "lbfgs", file = "tagger.crfsuite",
-             options = list(max_iterations = 25, feature.minfreq = 5, c1 = 0, c2 = 1)) 
-model
+             method = "lbfgs", file = "tagger.crfsuite", trace = TRUE,
+             options = list(max_iterations = 2500, feature.minfreq = 5, c1 = 0, c2 = 1)) 
+stats <- summary(model)
+```
+```{r}
+plot(stats$iterations$loss, pch = 20, type = "b", 
+     main = "Loss evolution", xlab = "Iteration", ylab = "Loss")
+```
+# Inference
+```{r}
+scores <- predict(model, 
+                  newdata = test[, c("upos", "upos_previous", "upos_next", "token", "token_previous", "token_next","dep_rel","dep_previous","dep_next")], 
+                  group = test$doc_id)
+test <- test %>% mutate(label = scores$label %>% as.factor,
+                        entity = as.factor(entity))
 ```
 
 # Mesure de l'accuracy
 ```{r TODO}
-
+library(caret)
+overview <- confusionMatrix(test$entity, test$label, mode = "prec_recall")
+overview$overall
+overview$byClass
 ```
+
+
+
+
+
 
 
